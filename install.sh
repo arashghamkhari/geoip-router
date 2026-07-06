@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW_URL="https://raw.githubusercontent.com/arashghamkhari/geoip-router/main"
-
 APP_NAME="geoip-router"
 APP_DIR="/opt/${APP_NAME}"
 VENV_DIR="${APP_DIR}/.venv"
-APP_FILE="${APP_DIR}/geoip_router.py"
+RELEASE_API="https://api.github.com/repos/arashghamkhari/geoip-router/releases/latest"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 CONFIG_FILE="/etc/geoip-router"
 
@@ -63,13 +61,51 @@ install_packages() {
   esac
 }
 
+get_latest_release_tarball_url() {
+  local release_json tarball_url
+  release_json="$(curl -fsSL "${RELEASE_API}")"
+  tarball_url="$(printf '%s' "${release_json}" | python3 - <<'PY'
+import json
+import sys
+
+data = json.load(sys.stdin)
+print(data.get("tarball_url") or "")
+PY
+)"
+  if [[ -z "${tarball_url}" ]]; then
+    echo "Unable to determine latest release tarball URL" >&2
+    exit 1
+  fi
+  printf '%s' "${tarball_url}"
+}
+
 install_app_files() {
+  local tmpdir release_archive extracted_dir tarball_url
+  rm -rf "${APP_DIR}"
+  tarball_url="$(get_latest_release_tarball_url)"
+  tmpdir="$(mktemp -d)"
+  release_archive="${tmpdir}/release.tar.gz"
+
+  echo "Downloading latest release from GitHub..."
+  curl -fsSL "${tarball_url}" -o "${release_archive}"
+
+  tar -xzf "${release_archive}" -C "${tmpdir}"
+
+  extracted_dir="$(find "${tmpdir}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [[ -z "${extracted_dir}" ]]; then
+    echo "Failed to extract release archive" >&2
+    exit 1
+  fi
+
   mkdir -p "${APP_DIR}"
+  (
+    cd "${extracted_dir}"
+    cp -a . "${APP_DIR}/"
+  )
 
-  echo "Downloading geoip_router.py from repository..."
-  curl -fsSL "${REPO_RAW_URL}/geoip_router.py" -o "${APP_FILE}"
+  chmod 0755 "${APP_DIR}/geoip_router.py"
 
-  chmod 0755 "${APP_FILE}"
+  rm -rf "${tmpdir}"
 }
 
 install_python_deps() {
@@ -111,7 +147,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=${VENV_DIR}/bin/python ${APP_FILE}
+ExecStart=${APP_DIR}/geoip_router.py
 Restart=always
 RestartSec=5
 User=root
