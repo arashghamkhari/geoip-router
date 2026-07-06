@@ -1,7 +1,0 @@
-#!/bin/bash
-
-rm -f /usr/bin/irr-apply
-rm -f /usr/bin/irr-update-database
-rm -f /etc/NetworkManager/dispatcher.d/90-ir-router
-
-rm -rf /var/lib/ir-router
