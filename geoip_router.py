@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import csv
-import hashlib
 import io
 import ipaddress
 import json
@@ -8,6 +7,7 @@ import signal
 import socket
 import sys
 import time
+import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +19,7 @@ from pyroute2.netlink.exceptions import NetlinkError
 
 CONFIG_FILE = Path("/etc/geoip-router")
 STATE_DIR = Path("/var/lib/geoip-router")
-DOWNLOAD_DIR = STATE_DIR / "downloads"  # You can use tmp directory for this purpose. Whe must remove zip file after converted to cidr. AI!
+
 EXPORT_DIR = STATE_DIR / "countries"
 STATE_FILE = STATE_DIR / "state.json"
 
@@ -49,7 +49,6 @@ class DesiredRoute:
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -115,15 +114,6 @@ def get_md5_from_remote() -> str:
     return response.text.strip().split()[0]
 
 
-# Do Not need to calculate md5 hash of downloaded file. just store md5 downloaded file that downloaded before by get_md5_from_remote and check new md5 file with it. AI!
-def file_md5(path: Path) -> str:
-    md5 = hashlib.md5()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            md5.update(chunk)
-    return md5.hexdigest()
-
-
 def download_zip(dest: Path) -> None:
     with requests.get(IP2LOCATION_URL, stream=True, timeout=120) as response:
         response.raise_for_status()
@@ -131,13 +121,6 @@ def download_zip(dest: Path) -> None:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
-
-
-# you should compare stored md5 hash of previous downloaded file with new md4 downloaded with get_md5_from_remote. Do not need to store zip file forever. AI!
-def should_update(local_zip: Path, remote_md5: str) -> bool:
-    if not local_zip.exists():
-        return True
-    return file_md5(local_zip) != remote_md5
 
 
 def extract_country_cidrs(zip_path: Path, export_dir: Path) -> Dict[str, Set[str]]:
@@ -196,17 +179,40 @@ def extract_country_cidrs(zip_path: Path, export_dir: Path) -> Dict[str, Set[str
     return country_cidrs
 
 
+def load_exported_cidrs(export_dir: Path, config: Config) -> Dict[str, Set[str]]:
+    country_cidrs: Dict[str, Set[str]] = {}
+    for country in sorted(config.countries.keys()):
+        cidr_file = export_dir / f"{country}.cidr"
+        if not cidr_file.exists():
+            continue
+
+        cidrs: Set[str] = set()
+        with cidr_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                cidr = line.strip()
+                if cidr:
+                    cidrs.add(cidr)
+
+        if cidrs:
+            country_cidrs[country] = cidrs
+
+    return country_cidrs
+
+
 def load_state() -> Dict:
     if not STATE_FILE.exists():
-        return {"applied_routes": []}
+        return {"last_md5": None}
     with STATE_FILE.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+    if not isinstance(state, dict):
+        state = {}
+    return {"last_md5": state.get("last_md5")}
 
 
 def save_state(state: Dict) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+        json.dump({"last_md5": state.get("last_md5")}, f, indent=2, sort_keys=True)
     tmp.replace(STATE_FILE)
 
 
@@ -325,24 +331,18 @@ def sync_routes(country_cidrs: Dict[str, Set[str]], config: Config) -> None:
         ))
 
         existing_snapshot = get_existing_routes_snapshot(ipr, iface_names)
-        desired_snapshot = {(r.cidr, r.iface, r.gateway) for r in desired_routes}
 
         to_add = desired_routes - {
             DesiredRoute(cidr=cidr, iface=iface, gateway=gateway)
             for cidr, iface, gateway in existing_snapshot
         }
 
-        state = load_state()
-        previous_applied = {
-            DesiredRoute(
-                cidr=item["cidr"],
-                iface=item["iface"],
-                gateway=item.get("gateway"),
-            )
-            for item in state.get("applied_routes", [])
+        existing_routes = {
+            DesiredRoute(cidr=cidr, iface=iface, gateway=gateway)
+            for cidr, iface, gateway in existing_snapshot
         }
 
-        to_remove = previous_applied - desired_routes
+        to_remove = existing_routes - desired_routes
 
         for route in to_add:
             add_route(ipr, route, link_indexes)
@@ -350,34 +350,23 @@ def sync_routes(country_cidrs: Dict[str, Set[str]], config: Config) -> None:
         for route in to_remove:
             delete_route(ipr, route, link_indexes)
 
-        state["applied_routes"] = [
-            {"cidr": r.cidr, "iface": r.iface, "gateway": r.gateway}
-            for r in sorted(desired_routes, key=lambda x: (x.iface, x.gateway or "", x.cidr))
-        ]
-        save_state(state)
-
 
 def cleanup_routes() -> None:
-    state = load_state()
-    applied_routes = [
-        DesiredRoute(
-            cidr=item["cidr"],
-            iface=item["iface"],
-            gateway=item.get("gateway"),
-        )
-        for item in state.get("applied_routes", [])
-    ]
+    try:
+        config = load_config()
+    except Exception:
+        return
 
-    if not applied_routes:
+    country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
+    desired_routes = build_desired_routes(country_cidrs, config)
+
+    if not desired_routes:
         return
 
     with IPRoute() as ipr:
-        link_indexes = get_link_indexes(ipr, set(applied_routes))
-        for route in applied_routes:
+        link_indexes = get_link_indexes(ipr, desired_routes)
+        for route in desired_routes:
             delete_route(ipr, route, link_indexes)
-
-    state["applied_routes"] = []
-    save_state(state)
 
 
 def main() -> None:
@@ -391,23 +380,23 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    local_zip = DOWNLOAD_DIR / "IP2LOCATION-LITE-DB1.CSV.ZIP"
-
     while not stop:
         try:
             config = load_config()
+            state = load_state()
             remote_md5 = get_md5_from_remote()
 
-            if should_update(local_zip, remote_md5):
-                tmp_zip = DOWNLOAD_DIR / "IP2LOCATION-LITE-DB1.CSV.ZIP.tmp"
-                download_zip(tmp_zip)
+            if state.get("last_md5") != remote_md5:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_zip = Path(tmpdir) / "IP2LOCATION-LITE-DB1.CSV.ZIP"
+                    download_zip(tmp_zip)
+                    extract_country_cidrs(tmp_zip, EXPORT_DIR)
+                state["last_md5"] = remote_md5
+                save_state(state)
 
-                if file_md5(tmp_zip) != remote_md5:
-                    raise ValueError("downloaded ZIP md5 mismatch")
-
-                tmp_zip.replace(local_zip)
-
-            country_cidrs = extract_country_cidrs(local_zip, EXPORT_DIR)
+            country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
+            if not country_cidrs:
+                raise ValueError("CIDR data is not available")
             sync_routes(country_cidrs, config)
 
         except Exception as exc:
