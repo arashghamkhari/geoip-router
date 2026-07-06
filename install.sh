@@ -63,19 +63,15 @@ install_packages() {
 
 get_latest_release_tarball_url() {
   local release_json tarball_url
-  release_json="$(curl -fsSL "${RELEASE_API}")"
-  tarball_url="$(printf '%s' "${release_json}" | python3 - <<'PY'
-import json
-import sys
 
-data = json.load(sys.stdin)
-print(data.get("tarball_url") or "")
-PY
-)"
+  release_json="$(curl -fsSL "${RELEASE_API}")"
+  tarball_url="$(printf '%s' "${release_json}" | grep -o '"tarball_url"[[:space:]]*:[[:space:]]*"[^"]*' | sed 's/"tarball_url"[[:space:]]*:[[:space:]]*"//')"
+
   if [[ -z "${tarball_url}" ]]; then
     echo "Unable to determine latest release tarball URL" >&2
     exit 1
   fi
+
   printf '%s' "${tarball_url}"
 }
 
@@ -110,15 +106,15 @@ install_app_files() {
 
 install_python_deps() {
   echo "Installing pipenv via pip..."
-  python3 -m pip install --upgrade pip
-  python3 -m pip install pipenv
+  python3 -m venv "${VENV_DIR}"
+  "${VENV_DIR}/bin/pip" install --upgrade pip pipenv
 
   echo "Creating Pipfile and installing dependencies via pipenv..."
   cd "${APP_DIR}"
 
   export PIPENV_VENV_IN_PROJECT=1
 
-  pipenv install requests pyroute2
+  "${VENV_DIR}/bin/pipenv" install requests pyroute2
 }
 
 install_config() {
@@ -130,8 +126,6 @@ install_config() {
 # FR=eth1:10.10.10.1
 # DE=eth2
 
-IR=eth0:192.168.1.1
-FR=eth5:10.10.10.1
 CFGEOF
     chmod 0644 "${CONFIG_FILE}"
   fi
@@ -147,7 +141,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=${APP_DIR}/geoip_router.py
+ExecStart=${APP_DIR}/.venv/bin/python ${APP_DIR}/geoip_router.py
 Restart=always
 RestartSec=5
 User=root
