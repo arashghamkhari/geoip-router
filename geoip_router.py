@@ -6,8 +6,8 @@ import json
 import signal
 import socket
 import sys
-import time
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -382,8 +382,13 @@ def main() -> None:
         try:
             config = load_config()
             state = load_state()
-            remote_md5 = get_md5_from_remote()
 
+            country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
+            if not country_cidrs:
+                raise ValueError("CIDR data is not available")
+            sync_routes(country_cidrs, config)
+
+            remote_md5 = get_md5_from_remote()
             if state.get("last_md5") != remote_md5:
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp_zip = Path(tmpdir) / "IP2LOCATION-LITE-DB1.CSV.ZIP"
@@ -391,11 +396,7 @@ def main() -> None:
                     extract_country_cidrs(tmp_zip, EXPORT_DIR)
                 state["last_md5"] = remote_md5
                 save_state(state)
-
-            country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
-            if not country_cidrs:
-                raise ValueError("CIDR data is not available")
-            sync_routes(country_cidrs, config)
+                continue
 
         except Exception as exc:
             print(f"[geoip-router] error: {exc}", file=sys.stderr)
