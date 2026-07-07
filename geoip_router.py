@@ -286,10 +286,9 @@ def get_existing_routes_snapshot(ipr: IPRoute, iface_names: Set[str]) -> Set[Tup
 
 
 def add_route(ipr: IPRoute, route: DesiredRoute, link_indexes: Dict[str, int]) -> None:
-    network = ipaddress.ip_network(route.cidr, strict=False)
     kwargs = {
-        "dst": str(network.network_address),
-        "mask": network.prefixlen,
+        "dst": route.cidr,
+        "gateway": route.gateway,
         "oif": link_indexes[route.iface],
     }
 
@@ -305,10 +304,9 @@ def add_route(ipr: IPRoute, route: DesiredRoute, link_indexes: Dict[str, int]) -
 
 
 def delete_route(ipr: IPRoute, route: DesiredRoute, link_indexes: Dict[str, int]) -> None:
-    network = ipaddress.ip_network(route.cidr, strict=False)
     kwargs = {
-        "dst": str(network.network_address),
-        "mask": network.prefixlen,
+        "dst": route.cidr,
+        "gateway": route.gateway,
         "oif": link_indexes[route.iface],
     }
 
