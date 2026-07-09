@@ -319,7 +319,11 @@ def delete_route(ipr: IPRoute, route: DesiredRoute, link_indexes: Dict[str, int]
         pass
 
 
-def sync_routes(country_cidrs: Dict[str, Set[str]], config: Config) -> None:
+def sync_routes(
+        country_cidrs: Dict[str, Set[str]],
+        config: Config,
+        managed_routes: Set[DesiredRoute],
+) -> Set[DesiredRoute]:
     desired_routes = build_desired_routes(country_cidrs, config)
     iface_names = {route.iface for route in desired_routes} or {cfg.iface for cfg in config.countries.values()}
 
@@ -329,18 +333,13 @@ def sync_routes(country_cidrs: Dict[str, Set[str]], config: Config) -> None:
         ))
 
         existing_snapshot = get_existing_routes_snapshot(ipr, iface_names)
-
-        to_add = desired_routes - {
-            DesiredRoute(cidr=cidr, iface=iface, gateway=gateway)
-            for cidr, iface, gateway in existing_snapshot
-        }
-
         existing_routes = {
             DesiredRoute(cidr=cidr, iface=iface, gateway=gateway)
             for cidr, iface, gateway in existing_snapshot
         }
 
-        to_remove = existing_routes - desired_routes
+        to_add = desired_routes - existing_routes
+        to_remove = managed_routes - desired_routes
 
         for route in to_add:
             add_route(ipr, route, link_indexes)
@@ -348,28 +347,23 @@ def sync_routes(country_cidrs: Dict[str, Set[str]], config: Config) -> None:
         for route in to_remove:
             delete_route(ipr, route, link_indexes)
 
+    return set(desired_routes)
 
-def cleanup_routes() -> None:
-    try:
-        config = load_config()
-    except Exception:
-        return
 
-    country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
-    desired_routes = build_desired_routes(country_cidrs, config)
-
-    if not desired_routes:
+def cleanup_routes(managed_routes: Set[DesiredRoute]) -> None:
+    if not managed_routes:
         return
 
     with IPRoute() as ipr:
-        link_indexes = get_link_indexes(ipr, desired_routes)
-        for route in desired_routes:
+        link_indexes = get_link_indexes(ipr, managed_routes)
+        for route in managed_routes:
             delete_route(ipr, route, link_indexes)
 
 
 def main() -> None:
     ensure_dirs()
     stop = False
+    managed_routes: Set[DesiredRoute] = set()
 
     def handle_signal(signum, frame):
         nonlocal stop
@@ -386,7 +380,7 @@ def main() -> None:
             country_cidrs = load_exported_cidrs(EXPORT_DIR, config)
             if not country_cidrs:
                 raise ValueError("CIDR data is not available")
-            sync_routes(country_cidrs, config)
+            managed_routes = sync_routes(country_cidrs, config, managed_routes)
 
             remote_md5 = get_md5_from_remote()
             if state.get("last_md5") != remote_md5:
@@ -406,7 +400,7 @@ def main() -> None:
                 break
             time.sleep(1)
 
-    cleanup_routes()
+    cleanup_routes(managed_routes)
 
 
 if __name__ == "__main__":
